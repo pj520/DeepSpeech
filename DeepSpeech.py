@@ -25,7 +25,7 @@ from util.audio import audiofile_to_input_vector
 from util.feeding import DataSet, ModelFeeder
 from util.gpu import get_available_gpus
 from util.shared_lib import check_cupti
-from util.text import sparse_tensor_value_to_texts, wer, Alphabet, ndarray_to_text
+from util.text import sparse_tensor_value_to_texts, wer, levenshtein, Alphabet, ndarray_to_text
 from xdg import BaseDirectory as xdg
 import numpy as np
 
@@ -155,6 +155,10 @@ tf.app.flags.DEFINE_float   ('valid_word_count_weight', 1.00, 'valid word insert
 # Inference mode
 
 tf.app.flags.DEFINE_string  ('one_shot_infer',       '',       'one-shot inference mode: specify a wav file and the script will load the checkpoint and perform inference on it. Disables training, testing and exporting.')
+
+# Initialize from frozen model
+
+tf.app.flags.DEFINE_string  ('initialize_from_frozen_model', '', 'path to frozen model to initialize from. This behaves like a checkpoint, loading the weights from the frozen model and starting training with those weights. The optimizer parameters aren\'t restored, so remember to adjust the learning rate.')
 
 for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
     tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
@@ -760,15 +764,17 @@ def calculate_report(results_tuple):
     '''
     samples = []
     items = list(zip(*results_tuple))
-    mean_wer = 0.0
+    total_levenshtein = 0.0
+    total_label_length = 0.0
     for label, decoding, distance, loss in items:
         sample_wer = wer(label, decoding)
         sample = Sample(label, decoding, loss, distance, sample_wer)
         samples.append(sample)
-        mean_wer += sample_wer
+        total_levenshtein += levenshtein(label.split(), decoding.split())
+        total_label_length += float(len(label.split()))
 
-    # Getting the mean WER from the accumulated one
-    mean_wer = mean_wer / len(items)
+    # Getting the WER from the accumulated levenshteins and lengths
+    samples_wer = total_levenshtein / total_label_length
 
     # Filter out all items with WER=0
     samples = [s for s in samples if s.wer > 0]
@@ -782,7 +788,7 @@ def calculate_report(results_tuple):
     # Order this top FLAGS.report_count items by their WER (lowest WER on top)
     samples.sort(key=lambda s: s.wer)
 
-    return mean_wer, samples
+    return samples_wer, samples
 
 def collect_results(results_tuple, returns):
     r'''
@@ -1548,6 +1554,26 @@ def train(server=None):
         saver = tf.train.Saver(max_to_keep=FLAGS.max_to_keep)
         hooks.append(tf.train.CheckpointSaverHook(checkpoint_dir=FLAGS.checkpoint_dir, save_secs=FLAGS.checkpoint_secs, saver=saver))
 
+    if len(FLAGS.initialize_from_frozen_model) > 0:
+        with tf.gfile.FastGFile(FLAGS.initialize_from_frozen_model, 'rb') as fin:
+            graph_def = tf.GraphDef()
+            graph_def.ParseFromString(fin.read())
+
+        var_names = [v.name for v in tf.trainable_variables()]
+        var_tensors = tf.import_graph_def(graph_def, return_elements=var_names)
+
+        # build a { var_name: var_tensor } dict
+        var_tensors = dict(zip(var_names, var_tensors))
+
+        training_graph = tf.get_default_graph()
+
+        assign_ops = []
+        for name, restored_tensor in var_tensors.items():
+            training_tensor = training_graph.get_tensor_by_name(name)
+            assign_ops.append(tf.assign(training_tensor, restored_tensor))
+
+        init_from_frozen_model_op = tf.group(*assign_ops)
+
     # The MonitoredTrainingSession takes care of session initialization,
     # restoring from a checkpoint, saving to a checkpoint, and closing when done
     # or an error occurs.
@@ -1558,6 +1584,12 @@ def train(server=None):
                                                checkpoint_dir=FLAGS.checkpoint_dir,
                                                save_checkpoint_secs=FLAGS.checkpoint_secs if FLAGS.train else None,
                                                config=session_config) as session:
+            if len(FLAGS.initialize_from_frozen_model) > 0:
+                log_info('Initializing from frozen model: {}'.format(FLAGS.initialize_from_frozen_model))
+                feed_dict = {}
+                model_feeder.set_data_set(feed_dict, model_feeder.train)
+                session.run(init_from_frozen_model_op, feed_dict=feed_dict)
+
             try:
                 if is_chief:
                     # Retrieving global_step from the (potentially restored) model
@@ -1717,7 +1749,7 @@ def export():
             actual_export_dir = os.path.join(FLAGS.export_dir, '%08d' % FLAGS.export_version)
             if os.path.isdir(actual_export_dir):
                 log_info('Removing old export')
-                shutil.rmtree(actual_FLAGS.export_dir)
+                shutil.rmtree(actual_export_dir)
         try:
             # Export serving model
             model_exporter.export(FLAGS.export_dir, tf.constant(FLAGS.export_version), session)
@@ -1741,8 +1773,8 @@ def export():
                                       output_graph_path, clear_devices, '')
 
             log_info('Models exported at %s' % (FLAGS.export_dir))
-        except RuntimeError:
-            log_error(sys.exc_info()[1])
+        except RuntimeError as e:
+            log_error(str(e))
 
 
 def do_single_file_inference(input_file_path):
